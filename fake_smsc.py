@@ -9,6 +9,8 @@ import struct
 import time
 import uuid
 import logging
+import signal
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -265,13 +267,18 @@ class FakeSMSC:
         self.host = host
         self.port = port
         self.dlr_delay = dlr_delay
+        self.server = None
+        self._shutdown_event = None
     
     async def handle_client(self, reader, writer):
         session = SMPPSession(reader, writer, self.dlr_delay)
         await session.handle()
     
     async def run(self):
-        server = await asyncio.start_server(
+        # Create shutdown event in the current event loop
+        self._shutdown_event = asyncio.Event()
+        
+        self.server = await asyncio.start_server(
             self.handle_client,
             self.host,
             self.port
@@ -280,8 +287,33 @@ class FakeSMSC:
         logger.info(f"Fake SMSC listening on {self.host}:{self.port}")
         logger.info(f"DLR delay: {self.dlr_delay} seconds")
         
-        async with server:
-            await server.serve_forever()
+        # Set up signal handlers for graceful shutdown (Unix only)
+        if sys.platform != 'win32':
+            try:
+                loop = asyncio.get_event_loop()
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, self._signal_handler)
+            except (NotImplementedError, ValueError):
+                # Signal handlers not available on this platform
+                pass
+        
+        try:
+            async with self.server:
+                await self._shutdown_event.wait()
+        except asyncio.CancelledError:
+            logger.info("Server cancelled, shutting down...")
+        finally:
+            logger.info("Shutting down server...")
+            if self.server:
+                self.server.close()
+                await self.server.wait_closed()
+            logger.info("Server stopped.")
+    
+    def _signal_handler(self):
+        """Handle shutdown signals."""
+        logger.info("Received shutdown signal, shutting down gracefully...")
+        if self._shutdown_event:
+            self._shutdown_event.set()
 
 
 if __name__ == '__main__':
@@ -312,8 +344,32 @@ if __name__ == '__main__':
 
     import six
 
-    from smpplib import consts, exceptions, pdu
-    from smpplib.ptypes import flag, ostr
+    try:
+        from smpplib import consts, exceptions, pdu
+        from smpplib.ptypes import flag, ostr
+    except ImportError:
+        # smpplib not installed - this embedded code is not used by the main SMSC server
+        # Define minimal stubs to prevent errors
+        class consts:
+            SMPP_ESME_ROK = 0x00000000
+            EMPTY_STRING = ''
+            NULL_STRING = b'\x00'
+            OPTIONAL_PARAMS = {}
+            INT_PACK_FORMATS = {1: 'B', 2: 'H', 4: 'I'}
+        
+        class exceptions:
+            class UnknownCommandError(Exception):
+                pass
+        
+        class pdu:
+            class PDU:
+                pass
+        
+        class flag:
+            pass
+        
+        class ostr:
+            pass
 
     logger = logging.getLogger('smpplib.command')
 
@@ -1285,4 +1341,8 @@ if __name__ == '__main__':
         dlr_delay=args.dlr_delay
     )
     
-    asyncio.run(smsc.run())
+    try:
+        asyncio.run(smsc.run())
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
+        sys.exit(0)
