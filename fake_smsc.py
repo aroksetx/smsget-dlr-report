@@ -263,7 +263,7 @@ class SMPPSession:
                             dest_addr=sm['destination_addr'],
                             message_id=message_id,
                             stat='REJECTD',
-                            err='008',
+                            err='000',
                             message_state=STATE_REJECTED
                         ))
                         await self.writer.drain()
