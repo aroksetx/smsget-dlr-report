@@ -197,7 +197,6 @@ class SMPPSession:
         try:
             while True:
                 pdu = await self.read_pdu()
-                print(pdu)
                 cmd = pdu['command_id']
                 seq = pdu['sequence_number']
                 
