@@ -241,7 +241,8 @@ class SMPPSession:
                             ))
                     else:
                         # Source is not reserved: reject message with invalid source address error
-                        body = self.make_cstring('')  # Empty message_id for rejected messages
+                        body = self.make_cstring('')
+                        self.write_pdu(ESME_ROK, seq, body=body)  
                         asyncio.create_task(self.send_dlr(
                             source_addr=sm['source_addr'],
                             dest_addr=sm['destination_addr'],
