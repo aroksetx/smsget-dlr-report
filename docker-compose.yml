@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  smsget-dlr-report:
+    image: aroksetx/smsget-dlr-report:latest
+    container_name: smsget-dlr-report
+    restart: unless-stopped
+    ports:
+      - "2776:2776"
+    # Add environment variables here if needed in the future
+    # environment:
+    #   - REDIS_HOST=52.57.134.177
+    #   - REDIS_PORT=6379
