@@ -11,6 +11,7 @@ import uuid
 import logging
 import signal
 import sys
+import redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,9 +35,12 @@ UNBIND = 0x00000006
 UNBIND_RESP = 0x80000006
 ENQUIRE_LINK = 0x00000015
 ENQUIRE_LINK_RESP = 0x80000015
+ESME_RINVSRCADR = 0x0000000A  # Invalid Source Address
 
 # SMPP Status
 ESME_ROK = 0x00000000
+
+rc_client = redis.Redis(host='52.57.134.177', port=6379, db=0, password='OAJUHyc1cLJwZ1nd8Ha8qM', username='default')
 
 
 class SMPPSession:
@@ -219,19 +223,31 @@ class SMPPSession:
                     message_id = uuid.uuid4().hex[:8]
                     
                     logger.info(f"[SUBMIT_SM] {sm['source_addr']} -> {sm['destination_addr']} msg_id={message_id}")
+                    reserved_key = f'dlr:block:{sm["source_addr"]}'
+                    is_reserved = rc_client.get(reserved_key)
+
+                    if is_reserved:
+                        logger.info(f"[RESERVED] {sm['source_addr']}")
+                        # submit_sm_resp
+                        body = self.make_cstring(message_id)
+                        self.write_pdu(SUBMIT_SM_RESP, seq, body=body)
+                        await self.writer.drain()
+                        
+                        # Schedule DLR if requested
+                        if sm['registered_delivery'] & 0x01:
+                            asyncio.create_task(self.send_dlr(
+                                source_addr=sm['source_addr'],
+                                dest_addr=sm['destination_addr'],
+                                message_id=message_id
+                            ))
+                    else:
+                        # Source is not reserved: reject message with invalid source address error
+                        body = self.make_cstring('')  # Empty message_id for rejected messages
+                        self.write_pdu(SUBMIT_SM_RESP, seq, status=ESME_RINVSRCADR, body=body)
+                        await self.writer.drain()
+                        
+                        logger.warning(f"[SUBMIT_SM REJECTED] source={sm['source_addr']} (not reserved) - ESME_RINVSRCADR")
                     
-                    # submit_sm_resp
-                    body = self.make_cstring(message_id)
-                    self.write_pdu(SUBMIT_SM_RESP, seq, body=body)
-                    await self.writer.drain()
-                    
-                    # Schedule DLR if requested
-                    if sm['registered_delivery'] & 0x01:
-                        asyncio.create_task(self.send_dlr(
-                            source_addr=sm['source_addr'],
-                            dest_addr=sm['destination_addr'],
-                            message_id=message_id
-                        ))
                 
                 elif cmd == ENQUIRE_LINK:
                     self.write_pdu(ENQUIRE_LINK_RESP, seq)
