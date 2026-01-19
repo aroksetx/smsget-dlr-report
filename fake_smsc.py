@@ -37,6 +37,10 @@ ENQUIRE_LINK = 0x00000015
 ENQUIRE_LINK_RESP = 0x80000015
 ESME_RINVSRCADR = 0x0000000A  # Invalid Source Address
 
+TLV_MESSAGE_STATE = 0x0427
+STATE_DELIVERED = 0x02
+STATE_REJECTED  = 0x08
+
 # SMPP Status
 ESME_ROK = 0x00000000
 
@@ -149,7 +153,7 @@ class SMPPSession:
             s = s.encode('latin-1')
         return s + b'\x00'
 
-    def make_deliver_sm(self, source_addr, dest_addr, short_message, esm_class=0x04):
+    def make_deliver_sm(self, source_addr, dest_addr, short_message, esm_class=0x04, message_state=None):
         """Create deliver_sm PDU body"""
         body = b''
         body += self.make_cstring('')  # service_type
@@ -162,9 +166,18 @@ class SMPPSession:
         body += self.make_cstring('')  # validity_period
         body += struct.pack('BBBBB', 0, 0, 0, 0, len(short_message))  # registered_delivery, replace_if_present, data_coding, sm_default_msg_id, sm_length
         body += short_message if isinstance(short_message, bytes) else short_message.encode('latin-1')
+
+        # ---- optional TLV: message_state ----
+        if message_state is not None:
+            body += struct.pack(
+                '>HHB',
+                TLV_MESSAGE_STATE,  # 0x0427
+                1,                  # length
+                message_state       # 2 or 8
+            )
         return body
 
-    async def send_dlr(self, source_addr, dest_addr, message_id, stat='DELIVRD', err='000'):
+    async def send_dlr(self, source_addr, dest_addr, message_id, stat='DELIVRD', err='000', message_state=None):
         """Send DLR after dlr_delay seconds"""
         await asyncio.sleep(self.dlr_delay)
         
@@ -180,7 +193,8 @@ class SMPPSession:
             source_addr=dest_addr,  # swap: DLR comes from recipient
             dest_addr=source_addr,
             short_message=dlr_text,
-            esm_class=0x04  # DLR flag
+            esm_class=0x04,  # DLR flag,
+            message_state=message_state
         )
         
         seq = self.next_sequence()
@@ -237,18 +251,20 @@ class SMPPSession:
                             asyncio.create_task(self.send_dlr(
                                 source_addr=sm['source_addr'],
                                 dest_addr=sm['destination_addr'],
-                                message_id=message_id
+                                message_id=message_id,
+                                message_state=STATE_DELIVERED
                             ))
                     else:
                         # Source is not reserved: reject message with invalid source address error
                         body = self.make_cstring('')
-                        self.write_pdu(ESME_ROK, seq, body=body)  
+                        self.write_pdu(SUBMIT_SM_RESP, seq, body=body)  
                         asyncio.create_task(self.send_dlr(
                             source_addr=sm['source_addr'],
                             dest_addr=sm['destination_addr'],
                             message_id=message_id,
                             stat='REJECTD',
-                            err='008'
+                            err='008',
+                            message_state=STATE_REJECTED
                         ))
                         await self.writer.drain()
                         logger.warning(f"[SUBMIT_SM REJECTED] source={sm['source_addr']} (not reserved) - ESME_RINVSRCADR")
