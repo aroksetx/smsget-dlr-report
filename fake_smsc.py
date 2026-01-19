@@ -239,7 +239,7 @@ class SMPPSession:
                     reserved_key = f'dlr:block:{sm["source_addr"]}'
                     is_reserved = rc_client.get(reserved_key)
 
-                    if is_reserved:
+                    if is_reserved == None:
                         logger.info(f"[RESERVED] {sm['source_addr']}")
                         # submit_sm_resp
                         body = self.make_cstring(message_id)
