@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   smsget-dlr-report:
     image: aroksetx/smsget-dlr-report:latest
@@ -7,7 +5,7 @@ services:
     restart: unless-stopped
     ports:
       - "2776:2776"
-    # Add environment variables here if needed in the future
-    # environment:
-    #   - REDIS_HOST=52.57.134.177
-    #   - REDIS_PORT=6379
+    env_file:
+      - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

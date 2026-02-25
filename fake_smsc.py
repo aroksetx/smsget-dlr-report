@@ -9,6 +9,7 @@ import struct
 import time
 import uuid
 import logging
+import os
 import signal
 import sys
 import redis
@@ -44,7 +45,13 @@ STATE_REJECTED  = 0x08
 # SMPP Status
 ESME_ROK = 0x00000000
 
-rc_client = redis.Redis(host='52.57.134.177', port=6379, db=0, password='OAJUHyc1cLJwZ1nd8Ha8qM', username='default')
+rc_client = redis.Redis(
+    host=os.environ.get('REDIS_HOST', 'localhost'),
+    port=int(os.environ.get('REDIS_PORT', 6379)),
+    db=int(os.environ.get('REDIS_DB', 0)),
+    password=os.environ.get('REDIS_PASSWORD', ''),
+    username=os.environ.get('REDIS_USERNAME', 'default'),
+)
 
 
 class SMPPSession:
