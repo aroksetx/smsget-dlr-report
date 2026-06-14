@@ -6,7 +6,8 @@ A lightweight, asynchronous Fake SMSC (Short Message Service Center) server for 
 
 - **Full SMPP 3.4 Protocol Support**: Implements core SMPP commands for message submission and delivery
 - **Asynchronous Design**: Built with Python's `asyncio` for efficient handling of multiple concurrent connections
-- **Delivery Receipt (DLR) Simulation**: Automatically sends delivery receipts after a configurable delay
+- **Activation-gated DLR Simulation**: Returns `DELIVRD` or `REJECTD` per message based on whether the destination number has an active activation (Redis `dlr:block:{number}`)
+- **Fail-open**: If Redis is unavailable, accepts (`DELIVRD`) rather than rejecting legitimate traffic
 - **Configurable**: Command-line options for host, port, and DLR delay
 - **Comprehensive Logging**: Detailed logging of all SMPP operations
 
@@ -103,6 +104,65 @@ id:<message_id> sub:001 dlvrd:001 submit date:<YYMMDDhhmm> done date:<YYMMDDhhmm
 
 The DLR is sent as a `deliver_sm` PDU with `esm_class=0x04` (delivery receipt indicator).
 
+### DLR Gating (accept vs reject)
+
+This harness simulates the carrier's accept/reject decision against live platform state:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Partner (reseller)
+    participant GW as smsget-api-gateway
+    participant R as Redis (shared)
+    participant J as Jasmin SMSC
+    participant F as fake_smsc<br/>(this repo)
+
+    rect rgb(235, 244, 255)
+    Note over P,R: Activation purchase — gateway marks the number it gave
+    P->>GW: GET_NUMBER
+    GW->>GW: create activation on number N
+    GW->>R: SET dlr:block:N "1" EX 1200
+    end
+
+    rect rgb(240, 240, 240)
+    Note over J,F: Inbound SMS for number N (e.g. OTP, source = "NETFLIX")
+    J->>F: submit_sm(source=NETFLIX, dest=N, registered_delivery=1)
+    F-->>J: submit_sm_resp(message_id)
+    Note right of F: dest = normalize(N)<br/>strip leading "+"
+    F->>R: GET dlr:block:N
+
+    alt key present → active activation
+        R-->>F: "1"
+        F-->>J: deliver_sm DLR — stat:DELIVRD (message_state=2)
+    else key absent → no activation
+        R-->>F: (nil)
+        F-->>J: deliver_sm DLR — stat:REJECTD (message_state=8)
+    else Redis error → fail-open
+        R--xF: error
+        F-->>J: deliver_sm DLR — stat:DELIVRD
+    end
+    end
+```
+
+- On `submit_sm`, it normalizes the **`destination_addr`** (our virtual number — digits only, leading `+` stripped) and checks Redis for `dlr:block:{number}`.
+- The `smsget-api-gateway` sets that key (20-min TTL) when it creates an activation (`utils/redis-cache.js` → `markActiveReservation`).
+- **Key present** → active activation → DLR `stat:DELIVRD` (`message_state=2`).
+- **Key absent** → no activation → DLR `stat:REJECTD` (`message_state=8`).
+- **Redis error** → fail-open: `DELIVRD`.
+
+The DLR is only emitted when the `submit_sm` requested one (`registered_delivery & 0x01`), for both outcomes.
+
+> Gotcha: the gate keys on the **destination** (the number we gave for the activation), not the source (the sender ID such as `NETFLIX`). The gateway writes digit-only keys (e.g. `dlr:block:79156537788`); both sides must agree on format or every message is rejected. Verify with `redis-cli MONITOR | grep dlr:block` (see `monitoring/DEPLOY.md` §0.6).
+
+## Configuration
+
+Redis connection is configured via environment (see `.env.example`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_HOST` / `REDIS_PORT` / `REDIS_DB` | `localhost` / `6379` / `0` | Redis used for activation gating |
+| `REDIS_USERNAME` / `REDIS_PASSWORD` | `default` / _(empty)_ | Redis auth |
+
 ## Architecture
 
 ### Classes
@@ -187,9 +247,9 @@ client.send_message(
 ## Limitations
 
 - **No authentication**: Accepts any system_id/password combination
-- **Fixed DLR status**: Always returns `DELIVRD` status
 - **No message storage**: Messages are not persisted
-- **Single status**: Does not simulate failed deliveries or other states
+- **DLR-only**: Sends delivery receipts (`esm_class=0x04`), not full MO message content
+- **Two states**: Simulates `DELIVRD` and `REJECTD` only (driven by activation gating), not the full SMPP message-state set
 
 ## Contributing
 

@@ -12,7 +12,7 @@ import logging
 import os
 import signal
 import sys
-import redis
+import redis.asyncio as redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,13 +45,25 @@ STATE_REJECTED  = 0x08
 # SMPP Status
 ESME_ROK = 0x00000000
 
+# Async client: a blocking sync GET would stall the whole asyncio loop (and every
+# other session) for the Redis RTT on every submit_sm. Short timeouts make a dead
+# Redis fail fast into the fail-open path instead of hanging the DLR.
 rc_client = redis.Redis(
     host=os.environ.get('REDIS_HOST', 'localhost'),
     port=int(os.environ.get('REDIS_PORT', 6379)),
     db=int(os.environ.get('REDIS_DB', 0)),
     password=os.environ.get('REDIS_PASSWORD', ''),
     username=os.environ.get('REDIS_USERNAME', 'default'),
+    socket_timeout=2,
+    socket_connect_timeout=2,
 )
+
+
+def normalize_msisdn(addr):
+    """Match the gateway's dlr:block key format (digits only, no leading '+')."""
+    if addr is None:
+        return addr
+    return addr.strip().lstrip('+')
 
 
 class SMPPSession:
@@ -184,10 +196,24 @@ class SMPPSession:
             )
         return body
 
+    async def has_active_activation(self, number):
+        """True if the destination number currently has an active activation.
+
+        The gateway sets `dlr:block:{number}` (digits only, 20-min TTL) when it
+        creates an activation. Fail-open: on any Redis error we accept (DELIVRD)
+        rather than reject legit upstream traffic on an infra blip.
+        """
+        key = f'dlr:block:{number}'
+        try:
+            return await rc_client.get(key) is not None
+        except Exception as e:
+            logger.error(f"[REDIS ERROR] fail-open (DELIVRD) for {key}: {e}")
+            return True
+
     async def send_dlr(self, source_addr, dest_addr, message_id, stat='DELIVRD', err='000', message_state=None):
         """Send DLR after dlr_delay seconds"""
         await asyncio.sleep(self.dlr_delay)
-        
+
         dlr_text = (
             f"id:{message_id} "
             f"sub:001 dlvrd:001 "
@@ -195,7 +221,7 @@ class SMPPSession:
             f"done date:{time.strftime('%y%m%d%H%M')} "
             f"stat:{stat} err:{err} text:"
         )
-        
+
         body = self.make_deliver_sm(
             source_addr=dest_addr,  # swap: DLR comes from recipient
             dest_addr=source_addr,
@@ -203,18 +229,23 @@ class SMPPSession:
             esm_class=0x04,  # DLR flag,
             message_state=message_state
         )
-        
+
         seq = self.next_sequence()
-        self.write_pdu(DELIVER_SM, seq, body=body)
-        await self.writer.drain()
-        
+        try:
+            self.write_pdu(DELIVER_SM, seq, body=body)
+            await self.writer.drain()
+        except Exception as e:
+            # Connection may have dropped during the dlr_delay sleep.
+            logger.warning(f"[DLR DROPPED] msg_id={message_id} stat={stat}: {e}")
+            return
+
         logger.info(f"[DLR SENT] msg_id={message_id} stat={stat}")
 
     async def handle(self):
         """Main processing loop"""
         addr = self.writer.get_extra_info('peername')
         logger.info(f"[CONNECT] {addr}")
-        
+
         try:
             while True:
                 pdu = await self.read_pdu()
@@ -241,41 +272,44 @@ class SMPPSession:
                 elif cmd == SUBMIT_SM:
                     sm = self.parse_submit_sm(pdu['body'])
                     message_id = uuid.uuid4().hex[:8]
-                    
-                    logger.info(f"[SUBMIT_SM] {sm['source_addr']} -> {sm['destination_addr']} msg_id={message_id}")
-                    reserved_key = f'dlr:block:{sm["source_addr"]}'
-                    is_reserved = rc_client.get(reserved_key)
 
-                    if is_reserved:
-                        logger.info(f"[RESERVED] {sm['source_addr']}")
-                        # submit_sm_resp
-                        body = self.make_cstring(message_id)
-                        self.write_pdu(SUBMIT_SM_RESP, seq, body=body)
-                        await self.writer.drain()
-                        
-                        # Schedule DLR if requested
-                        if sm['registered_delivery'] & 0x01:
+                    logger.info(f"[SUBMIT_SM] {sm['source_addr']} -> {sm['destination_addr']} msg_id={message_id}")
+
+                    # Always acknowledge the submit_sm itself.
+                    body = self.make_cstring(message_id)
+                    self.write_pdu(SUBMIT_SM_RESP, seq, body=body)
+                    await self.writer.drain()
+
+                    # DLR gating is keyed on the DESTINATION (the number we gave
+                    # for the activation), NOT the source (the external sender
+                    # like "NETFLIX"). The gateway sets dlr:block:{our_number}
+                    # on activation creation.
+                    dest_number = normalize_msisdn(sm['destination_addr'])
+                    accept = await self.has_active_activation(dest_number)
+                    requested_dlr = bool(sm['registered_delivery'] & 0x01)
+
+                    if accept:
+                        if requested_dlr:
                             asyncio.create_task(self.send_dlr(
                                 source_addr=sm['source_addr'],
                                 dest_addr=sm['destination_addr'],
                                 message_id=message_id,
+                                stat='DELIVRD',
                                 message_state=STATE_DELIVERED
                             ))
+                        logger.info(f"[ACCEPT] dest={dest_number} (active activation) msg_id={message_id}")
                     else:
-                        # Source is not reserved: reject message with invalid source address error
-                        body = self.make_cstring(message_id)
-                        self.write_pdu(SUBMIT_SM_RESP, seq, body=body)  
-                        asyncio.create_task(self.send_dlr(
-                            source_addr=sm['source_addr'],
-                            dest_addr=sm['destination_addr'],
-                            message_id=message_id,
-                            stat='REJECTD',
-                            message_state=STATE_REJECTED
-                        ))
-                        await self.writer.drain()
-                        logger.warning(f"[SUBMIT_SM REJECTED] source={sm['source_addr']} (not reserved) - ESME_RINVSRCADR")
-                    
-                
+                        if requested_dlr:
+                            asyncio.create_task(self.send_dlr(
+                                source_addr=sm['source_addr'],
+                                dest_addr=sm['destination_addr'],
+                                message_id=message_id,
+                                stat='REJECTD',
+                                message_state=STATE_REJECTED
+                            ))
+                        logger.warning(f"[REJECT] dest={dest_number} (no active activation) msg_id={message_id}")
+
+
                 elif cmd == ENQUIRE_LINK:
                     self.write_pdu(ENQUIRE_LINK_RESP, seq)
                     await self.writer.drain()
@@ -320,13 +354,13 @@ class FakeSMSC:
     async def run(self):
         # Create shutdown event in the current event loop
         self._shutdown_event = asyncio.Event()
-        
+
         self.server = await asyncio.start_server(
             self.handle_client,
             self.host,
             self.port
         )
-        
+
         logger.info(f"Fake SMSC listening on {self.host}:{self.port}")
         logger.info(f"DLR delay: {self.dlr_delay} seconds")
         
@@ -1377,7 +1411,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=2776, help='Bind port')
     parser.add_argument('--dlr-delay', type=int, default=5, help='DLR delay in seconds')
     args = parser.parse_args()
-    
+
     smsc = FakeSMSC(
         host=args.host,
         port=args.port,
